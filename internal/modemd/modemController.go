@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/TheCacophonyProject/event-reporter/v3/eventclient"
@@ -66,6 +67,8 @@ type ModemController struct {
 	stayOffUntil         time.Time
 	onOffReason          string
 	IsPowered            bool
+	poweredOnTime        time.Time
+	shuttingDown         atomic.Bool // Set from when the modem starts shutting down until it is next powered on.
 
 	failedToFindModem   bool
 	failedToFindSimCard bool
@@ -255,6 +258,11 @@ func (mc *ModemController) GetGPSStatus() (*gpsData, error) {
 }
 */
 
+// atAvailable returns whether AT commands can be sent to the modem.
+func (mc *ModemController) atAvailable() bool {
+	return mc.Modem != nil && mc.Modem.ATReady && !mc.shuttingDown.Load()
+}
+
 func (mc *ModemController) GetStatus() (map[string]interface{}, error) {
 	status := make(map[string]interface{})
 	status["timestamp"] = time.Now().Format(time.RFC1123Z)
@@ -269,9 +277,9 @@ func (mc *ModemController) GetStatus() (map[string]interface{}, error) {
 		modem["name"] = mc.Modem.Name
 		modem["netdev"] = mc.Modem.Netdev
 		modem["vendor"] = mc.Modem.VendorID + ":" + mc.Modem.ProductID
-		modem["atReady"] = mc.Modem.ATReady
+		modem["atReady"] = mc.atAvailable()
 		modem["connectedTime"] = mc.connectedTime.Format(time.RFC1123Z)
-		if mc.Modem.ATReady {
+		if mc.atAvailable() {
 			modem["voltage"] = valueOrErrorStr(mc.readVoltage())
 			modem["temp"] = valueOrErrorStr(mc.readTemp())
 			modem["manufacturer"] = valueOrErrorStr(mc.getManufacturer())
@@ -282,7 +290,7 @@ func (mc *ModemController) GetStatus() (map[string]interface{}, error) {
 		status["modem"] = modem
 
 		// Set details for signal
-		if mc.Modem.ATReady {
+		if mc.atAvailable() {
 			signal := make(map[string]interface{})
 			signalStrength, bitErrorRate, signalStatus, err := mc.signalStrength()
 			if err != nil {
@@ -307,7 +315,7 @@ func (mc *ModemController) GetStatus() (map[string]interface{}, error) {
 		// Set details for SIM card
 		simCard := make(map[string]interface{})
 		simCard["simCardStatus"] = mc.Modem.SimCardStatus
-		if mc.Modem.SimCardStatus == SimCardReady {
+		if mc.Modem.SimCardStatus == SimCardReady && mc.atAvailable() {
 			simCard["ICCID"] = valueOrErrorStr(mc.readSimICCID())
 			simCard["provider"] = valueOrErrorStr(mc.readSimProvider())
 		}
@@ -651,7 +659,22 @@ func (mc *ModemController) readBand() (string, error) {
 	return "", err
 }
 
+var errModemShuttingDown = errors.New("modem is shutting down")
+
 func (mc *ModemController) RunATCommand(atCommand string, timeoutMsec int, attempts int) (string, error) {
+	if mc.shuttingDown.Load() {
+		return "", errModemShuttingDown
+	}
+	return mc.requestATCommand(atCommand, timeoutMsec, attempts)
+}
+
+// runATCommandUnchecked sends an AT command even if the modem is shutting down.
+func (mc *ModemController) runATCommandUnchecked(atCommand string, timeoutMsec int, attempts int) error {
+	_, err := mc.requestATCommand(atCommand, timeoutMsec, attempts)
+	return err
+}
+
+func (mc *ModemController) requestATCommand(atCommand string, timeoutMsec int, attempts int) (string, error) {
 	if mc.Modem == nil {
 		return "", errors.New("modem not connected")
 	}
@@ -683,7 +706,11 @@ func (mc *ModemController) SetModemPower(on bool) error {
 		return fmt.Errorf("failed to init GPIO20 pin")
 	}
 	if on {
+		mc.shuttingDown.Store(false)
 		log.Println("Powering on USB modem")
+		if !mc.IsPowered {
+			mc.poweredOnTime = time.Now()
+		}
 		if err := pinEn.Out(gpio.High); err != nil {
 			return fmt.Errorf("failed to set modem power pin high: %v", err)
 		}
@@ -691,7 +718,13 @@ func (mc *ModemController) SetModemPower(on bool) error {
 			return fmt.Errorf("failed to enable power for the modem: %v", err)
 		}
 	} else {
-		_, _ = mc.RunATCommand("AT+CPOF", 1000, 0)
+		// Refuse other AT commands first. One sent after this never gets read, so closing the port
+		// would wait for it to send, up to the port's 30 second closing_wait. That holds the tty lock,
+		// which stops the kernel removing the USB device, so the modem looks like it hasn't shut down.
+		mc.shuttingDown.Store(true)
+		if err := mc.runATCommandUnchecked("AT+CPOF", 1000, 0); err != nil {
+			log.Printf("Failed to send modem shutdown command: %v", err)
+		}
 		if mc.Modem != nil {
 			mc.Modem.ATReady = false
 		}
@@ -806,8 +839,41 @@ func wifiDonglePresent() bool {
 	return false
 }
 
-func (mc *ModemController) CycleModemPower() error {
+// Replaced in tests.
+var addEvent = eventclient.AddEvent
+
+// powerOffModem powers off the modem and reports it with a modemPoweredOff event, with reason
+// saying why. event-reporter sends it once there is a connection, as requesting one could
+// power the modem back on.
+func (mc *ModemController) powerOffModem(reason string) error {
+	wasPowered := mc.IsPowered
+	onFor := time.Since(mc.poweredOnTime)
 	if err := mc.SetModemPower(false); err != nil {
+		return err
+	}
+	if !wasPowered {
+		return nil
+	}
+	log.Infof("Modem powered off after %s: %s", onFor.Round(time.Second), reason)
+	if err := addEvent(modemPoweredOffEvent(time.Now(), reason, onFor)); err != nil {
+		log.Errorf("Failed to make modemPoweredOff event: %v", err)
+	}
+	return nil
+}
+
+func modemPoweredOffEvent(now time.Time, reason string, onFor time.Duration) eventclient.Event {
+	return eventclient.Event{
+		Timestamp: now.UTC(),
+		Type:      "modemPoweredOff",
+		Details: map[string]any{
+			"reason":    reason,
+			"onSeconds": int(onFor.Seconds()),
+		},
+	}
+}
+
+func (mc *ModemController) CycleModemPower() error {
+	if err := mc.powerOffModem("Modem power cycle was requested."); err != nil {
 		return err
 	}
 	return mc.SetModemPower(true)

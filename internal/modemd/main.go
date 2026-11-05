@@ -61,6 +61,7 @@ const (
 	pingRetryDelay      = 2 * time.Second  // Time between ping tests while waiting for a connection.
 	pingPowerOnAttempts = 2                // Times to power on the modem to get a ping before waiting RetryInterval.
 	pingRecheckInterval = 30 * time.Second // Time between regular ping tests after one has failed.
+	modemInUseInterval  = 30 * time.Second // Time between checks that a connected modem is still needed.
 )
 
 func procArgs(input []string) (Args, error) {
@@ -167,7 +168,7 @@ MainModemLoop:
 		// =========== Power off modem if it shouldn't be on then wait until it should be on ===========
 		if !mc.ShouldBeOn() {
 			log.Println("Powering off USB modem.")
-			if err := mc.SetModemPower(false); err != nil {
+			if err := mc.powerOffModem(mc.onOffReason); err != nil {
 				return err
 			}
 			mc.Modem = nil
@@ -358,7 +359,7 @@ MainModemLoop:
 			if simCardAttempts < mc.simCardPowerOnAttemptsAllowed() {
 				mc.networkDiagnostics()
 				log.Info("SIM card not found. Cycling modem power to try again.")
-				if err := mc.SetModemPower(false); err != nil {
+				if err := mc.powerOffModem("Cycling power because the SIM card was not found."); err != nil {
 					return err
 				}
 				mc.Modem = nil
@@ -468,7 +469,7 @@ MainModemLoop:
 					// The modem can start up in a state where it doesn't register on the
 					// network, so try again now as the camera might not be on for long.
 					log.Info("Cycling modem power to try again.")
-					if err := mc.SetModemPower(false); err != nil {
+					if err := mc.powerOffModem("Cycling power because the modem could not ping."); err != nil {
 						return err
 					}
 					mc.Modem = nil
@@ -486,6 +487,7 @@ MainModemLoop:
 				logSetupTimings()
 				pingAttempts = 0
 				mc.connectedTime = time.Now()
+				mc.lastSuccessfulPing = mc.connectedTime
 				makeModemEvent("modemConnectedToNetwork", &mc)
 				sendModemConnectedSignal() // This send a dbus signal that allows programs to trigger events when the modem connects.
 				break
@@ -501,7 +503,9 @@ MainModemLoop:
 		log.Infof("Running ping tests every %s, or every %s after one fails.", mc.TestInterval, nextPingTestDelay(mc.TestInterval, 1))
 		pingFailCount := 0
 		for {
-			time.Sleep(nextPingTestDelay(mc.TestInterval, pingFailCount))
+			if !waitWhileNeeded(nextPingTestDelay(mc.TestInterval, pingFailCount), modemInUseInterval, mc.ShouldBeOn) {
+				continue MainModemLoop // The start of the main loop powers off the modem.
+			}
 			log.Debug("Running a regular ping test.")
 			if mc.PingTest(pingTimeoutSec) {
 				mc.lastSuccessfulPing = time.Now()
@@ -664,6 +668,22 @@ func nextPingTestDelay(testInterval time.Duration, pingFailCount int) time.Durat
 		return min(testInterval, pingRecheckInterval)
 	}
 	return testInterval
+}
+
+// waitWhileNeeded waits for the duration, checking stillNeeded at each interval, and returns false
+// as soon as stillNeeded does.
+func waitWhileNeeded(duration, interval time.Duration, stillNeeded func() bool) bool {
+	deadline := time.Now().Add(duration)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return true
+		}
+		time.Sleep(min(interval, remaining))
+		if !stillNeeded() {
+			return false
+		}
+	}
 }
 
 // logRegistrationChange logs the modem's network registration state if it has changed from last,

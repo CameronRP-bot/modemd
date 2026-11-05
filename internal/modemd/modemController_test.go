@@ -291,3 +291,119 @@ func TestSetupTimer(t *testing.T) {
 		t.Errorf("finish after restarting = %q, want %q", got, want)
 	}
 }
+
+func TestWaitWhileNeeded(t *testing.T) {
+	checks := 0
+	if !waitWhileNeeded(5*time.Millisecond, time.Millisecond, func() bool {
+		checks++
+		return true
+	}) {
+		t.Error("expected true when still needed for the whole wait")
+	}
+	if checks == 0 {
+		t.Error("expected it to check if still needed")
+	}
+
+	start := time.Now()
+	checks = 0
+	if waitWhileNeeded(time.Hour, time.Millisecond, func() bool {
+		checks++
+		return checks < 3
+	}) {
+		t.Error("expected false once no longer needed")
+	}
+	if checks != 3 {
+		t.Errorf("checks = %d, want 3", checks)
+	}
+	if time.Since(start) > 10*time.Second {
+		t.Error("should stop waiting as soon as it is no longer needed")
+	}
+}
+
+func TestShouldBeOnAfterConnecting(t *testing.T) {
+	mc := ModemController{
+		StartTime:         time.Now().Add(-time.Hour),
+		InitialOnDuration: 20 * time.Minute,
+		RequestOnDuration: 2 * time.Minute,
+		MinConnDuration:   time.Minute,
+		MaxOffDuration:    24 * time.Hour,
+		RetryInterval:     20 * time.Minute,
+	}
+	mc.connectedTime = time.Now()
+	mc.lastSuccessfulPing = mc.connectedTime
+	if !mc.ShouldBeOn() {
+		t.Error("expected on during the minimum connection time")
+	}
+
+	mc.connectedTime = time.Now().Add(-2 * time.Minute)
+	mc.lastSuccessfulPing = mc.connectedTime
+	if mc.ShouldBeOn() {
+		t.Error("expected off when nothing needs the modem")
+	}
+
+	mc.lastOnRequestTime = time.Now()
+	if !mc.ShouldBeOn() {
+		t.Error("expected on while connections are being requested")
+	}
+}
+
+// The AT manager's queue is never read, so a request that reaches it would block the test.
+func modemForShutdownTest() *Modem {
+	return &Modem{ATReady: true, SimCardStatus: SimCardReady, ATManager: &atManager{requests: make(chan atRequest)}}
+}
+
+func TestRunATCommandRefusedWhileShuttingDown(t *testing.T) {
+	mc := &ModemController{Modem: modemForShutdownTest()}
+	mc.shuttingDown.Store(true)
+
+	if _, err := mc.RunATCommand("AT+CSQ", 1000, 1); !errors.Is(err, errModemShuttingDown) {
+		t.Errorf("err = %v, want %v", err, errModemShuttingDown)
+	}
+	if mc.atAvailable() {
+		t.Error("expected AT commands to be unavailable while shutting down")
+	}
+
+	mc.shuttingDown.Store(false)
+	if !mc.atAvailable() {
+		t.Error("expected AT commands to be available again")
+	}
+}
+
+// managementd asks for the status every 5 seconds, including while the modem shuts down.
+func TestGetStatusSendsNoATCommandsWhileShuttingDown(t *testing.T) {
+	mc := &ModemController{Modem: modemForShutdownTest()}
+	mc.shuttingDown.Store(true)
+
+	status, err := mc.GetStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	modem := status["modem"].(map[string]interface{})
+	if modem["atReady"] != false {
+		t.Errorf("atReady = %v, want false", modem["atReady"])
+	}
+	if _, ok := modem["voltage"]; ok {
+		t.Error("should not read the voltage while shutting down")
+	}
+	if _, ok := status["signal"]; ok {
+		t.Error("should not read the signal while shutting down")
+	}
+	if _, ok := status["simCard"].(map[string]interface{})["ICCID"]; ok {
+		t.Error("should not read the SIM card while shutting down")
+	}
+}
+
+func TestModemPoweredOffEvent(t *testing.T) {
+	now := time.Date(2026, 11, 6, 13, 0, 0, 0, time.FixedZone("NZDT", 13*3600))
+	event := modemPoweredOffEvent(now, "No reason the modem should be on.", 90*time.Second+400*time.Millisecond)
+
+	if event.Type != "modemPoweredOff" {
+		t.Errorf("type = %q", event.Type)
+	}
+	if !event.Timestamp.Equal(now) || event.Timestamp.Location() != time.UTC {
+		t.Errorf("timestamp = %v, want %v in UTC", event.Timestamp, now)
+	}
+	if event.Details["reason"] != "No reason the modem should be on." || event.Details["onSeconds"] != 90 {
+		t.Errorf("details = %v", event.Details)
+	}
+}
