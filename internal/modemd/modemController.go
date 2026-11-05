@@ -897,6 +897,51 @@ func (mc *ModemController) ShouldBeOn() bool {
 	return on
 }
 
+// networkDiagnosticCommands are read only AT commands showing why the modem might not be working.
+var networkDiagnosticCommands = []string{
+	"AT+CPIN?",  // SIM card status.
+	"AT+CSQ",    // Signal strength.
+	"AT+CFUN?",  // Is the radio enabled.
+	"AT+COPS?",  // Selected operator.
+	"AT+CREG?",  // Registration status, circuit switched.
+	"AT+CGREG?", // Registration status, 2G/3G data.
+	"AT+CEREG?", // Registration status, 4G data.
+	"AT+CGATT?", // Attached to the data network.
+	"AT+CPSI?",  // System information (SIMCom specific).
+	"AT+CEER",   // Last error reported by the network.
+}
+
+// registrationCommands are read only AT commands showing the modem's state on the mobile network.
+var registrationCommands = []string{"AT+COPS?", "AT+CREG?", "AT+CGREG?", "AT+CEREG?"}
+
+// diagnosticResponse returns the modem's reply to an AT command, or why it didn't reply.
+func (mc *ModemController) diagnosticResponse(cmd string) string {
+	out, err := mc.RunATCommand(cmd, 1000, 1)
+	if err != nil {
+		return fmt.Sprintf("%s failed: %v", cmd, err)
+	}
+	return out
+}
+
+// networkDiagnostics logs and returns the state of the modem, for when it has failed.
+func (mc *ModemController) networkDiagnostics() map[string]string {
+	diagnostics := make(map[string]string, len(networkDiagnosticCommands))
+	for _, cmd := range networkDiagnosticCommands {
+		diagnostics[cmd] = mc.diagnosticResponse(cmd)
+		log.Infof("Modem diagnostics: %s: %s", cmd, diagnostics[cmd])
+	}
+	return diagnostics
+}
+
+// registrationState returns a summary of the modem's state on the mobile network.
+func (mc *ModemController) registrationState() string {
+	states := make([]string, 0, len(registrationCommands))
+	for _, cmd := range registrationCommands {
+		states = append(states, mc.diagnosticResponse(cmd))
+	}
+	return strings.Join(states, ", ")
+}
+
 func (mc *ModemController) PingTest(timeoutSec int) bool {
 	return mc.Modem.PingTest(timeoutSec, mc.TestHosts)
 }

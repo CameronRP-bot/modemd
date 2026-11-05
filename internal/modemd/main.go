@@ -56,6 +56,13 @@ func (Args) Version() string {
 
 const modemSetupSteps = 10
 
+const (
+	pingTimeoutSec      = 5                // Timeout for pinging each test host.
+	pingRetryDelay      = 2 * time.Second  // Time between ping tests while waiting for a connection.
+	pingPowerOnAttempts = 2                // Times to power on the modem to get a ping before waiting RetryInterval.
+	pingRecheckInterval = 30 * time.Second // Time between regular ping tests after one has failed.
+)
+
 func procArgs(input []string) (Args, error) {
 	args := defaultArgs
 
@@ -154,6 +161,7 @@ func Run(inputArgs []string, ver string) error {
 
 	// Setting the label for the main loop
 	simCardAttempts := 0
+	pingAttempts := 0
 MainModemLoop:
 	for {
 		// =========== Power off modem if it shouldn't be on then wait until it should be on ===========
@@ -164,6 +172,7 @@ MainModemLoop:
 			}
 			mc.Modem = nil
 			simCardAttempts = 0
+			pingAttempts = 0
 			// Wait until the modem no longer should be off
 			for !mc.ShouldBeOn() {
 				time.Sleep(time.Second)
@@ -250,6 +259,10 @@ MainModemLoop:
 			if err == nil {
 				log.Println("AT command responding.")
 				mc.Modem.ATReady = true
+				// Enable verbose error messages so a failed AT command says why.
+				if _, err := mc.RunATCommand("AT+CMEE=2", 1000, 1); err != nil {
+					log.Errorf("Failed to enable verbose AT errors: %v", err)
+				}
 				break
 			}
 
@@ -343,6 +356,7 @@ MainModemLoop:
 		}
 		if mc.Modem.SimCardStatus != SimCardReady {
 			if simCardAttempts < mc.simCardPowerOnAttemptsAllowed() {
+				mc.networkDiagnostics()
 				log.Info("SIM card not found. Cycling modem power to try again.")
 				if err := mc.SetModemPower(false); err != nil {
 					return err
@@ -352,7 +366,7 @@ MainModemLoop:
 			}
 			simCardAttempts = 0
 			mc.Modem.SimCardStatus = SimCardFailed
-			makeModemEvent("noModemSimCard", &mc)
+			makeModemFailureEvent("noModemSimCard", &mc)
 			mc.failedToFindSimCard = true
 			mc.lastFailedSimCard = time.Now()
 			mc.simCardFailsInARow++
@@ -375,22 +389,24 @@ MainModemLoop:
 		// ========== Checking signal strength ===========
 		printSetupStep(7, "Checking signal strength.")
 		getSignalStrengthTimeout := time.Now().Add(2 * time.Minute)
+		lastRegistrationState := ""
 		for {
-			strengthStr, bitErrorRate, status, _ := mc.signalStrength()
-			if strengthStr != 99 {
+			strengthStr, bitErrorRate, status, err := mc.signalStrength()
+			if signalFound(strengthStr, err) {
 				log.Printf("Signal strength: %d", strengthStr)
 				log.Printf("Bit error rate: %d", bitErrorRate)
 				log.Printf("Signal status: %s", status)
 				makeModemEvent("modemSignal", &mc)
 				break
 			}
-			log.Debugf("Signal strength not found, waiting 3 seconds then looking again.")
+			lastRegistrationState = logRegistrationChange(&mc, lastRegistrationState)
+			log.Debugf("Signal strength not found (error: %v), waiting 3 seconds then looking again.", err)
 			time.Sleep(3 * time.Second)
 
 			if time.Now().After(getSignalStrengthTimeout) {
-				log.Info("Timed out waiting for signal strength.")
+				log.Infof("Timed out waiting for signal strength. Last error: %v", err)
 				mc.lastFailedConnection = time.Now()
-				makeModemEvent("noModemSignal", &mc)
+				makeModemFailureEvent("noModemSignal", &mc)
 				continue MainModemLoop
 			}
 		}
@@ -398,11 +414,13 @@ MainModemLoop:
 		// ========== Checking that the network is up ===========
 		printSetupStep(8, "Checking that the network is up.")
 		networkUpTimeout := time.Now().Add(2 * time.Minute)
+		var addrs []net.Addr
 		for {
 			if time.Now().After(networkUpTimeout) {
-				// Took too long to find the network, try from the start again.
-				makeModemEvent("noModemNetwork", &mc)
-				log.Errorf("Took too long to find the network.")
+				// Took too long to find the network. Wait before trying again to save power.
+				makeModemFailureEvent("noModemNetwork", &mc)
+				log.Errorf("Took too long to get an IPv4 address on %s, found addresses: %v", mc.Modem.Netdev, addrs)
+				mc.lastFailedConnection = time.Now()
 				continue MainModemLoop
 			}
 
@@ -413,14 +431,15 @@ MainModemLoop:
 				time.Sleep(time.Second)
 				continue
 			}
-			addrs, err := iface.Addrs()
+			addrs, err = iface.Addrs()
 			if err != nil {
 				log.Errorf("Failed to get network addresses: %v", err)
 				time.Sleep(time.Second)
 				continue
 			}
-			if len(addrs) == 0 {
-				log.Error("No network addresses found, waiting a second then looking again.")
+			// The modem gives out an IPv4 address, and a link-local IPv6 address alone can't reach the test hosts.
+			if !hasIPv4Address(addrs) {
+				log.Debugf("No IPv4 address found, waiting a second then looking again. Addresses: %v", addrs)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -431,7 +450,8 @@ MainModemLoop:
 		}
 
 		// ============ Checking ping through the network ============
-		printSetupStep(9, "Checking ping through the network.")
+		pingAttempts++
+		printSetupStep(9, fmt.Sprintf("Checking ping through the network (power on attempt %d of %d).", pingAttempts, pingPowerOnAttempts))
 		pingingTimeout := time.Now().Add(mc.ConnectionTimeout)
 		for {
 			// Check if the modem should still be on.
@@ -441,33 +461,49 @@ MainModemLoop:
 			}
 
 			if time.Now().After(pingingTimeout) {
-				// Took too long to ping, try from the start again.
-				makeModemEvent("noModemPing", &mc)
+				// Took too long to ping.
+				makeModemFailureEvent("noModemPing", &mc)
 				log.Errorf("Took too long to ping.")
+				if pingAttempts < pingPowerOnAttempts {
+					// The modem can start up in a state where it doesn't register on the
+					// network, so try again now as the camera might not be on for long.
+					log.Info("Cycling modem power to try again.")
+					if err := mc.SetModemPower(false); err != nil {
+						return err
+					}
+					mc.Modem = nil
+					continue MainModemLoop
+				}
+				pingAttempts = 0
 				mc.lastFailedConnection = time.Now()
 				continue MainModemLoop
 			}
 
-			if mc.PingTest(5000) { // This ping test run the ping test through the modem, not the wifi if available.
+			lastRegistrationState = logRegistrationChange(&mc, lastRegistrationState)
+
+			if mc.PingTest(pingTimeoutSec) { // This ping test run the ping test through the modem, not the wifi if available.
 				log.Info("Modem has connected to a network.")
+				logSetupTimings()
+				pingAttempts = 0
 				mc.connectedTime = time.Now()
 				makeModemEvent("modemConnectedToNetwork", &mc)
 				sendModemConnectedSignal() // This send a dbus signal that allows programs to trigger events when the modem connects.
 				break
 			} else {
 				log.Infof("Ping test failed. Trying again until the %s timeout.", mc.ConnectionTimeout)
+				time.Sleep(pingRetryDelay) // Ping can fail straight away, e.g. if the interface has gone.
 			}
 		}
 
 		// Network is all ready now I guess?
 
 		// ========== Running regular ping tests =============
-		log.Infof("Running ping tests every %s.", mc.TestInterval)
+		log.Infof("Running ping tests every %s, or every %s after one fails.", mc.TestInterval, nextPingTestDelay(mc.TestInterval, 1))
 		pingFailCount := 0
 		for {
-			time.Sleep(mc.TestInterval)
+			time.Sleep(nextPingTestDelay(mc.TestInterval, pingFailCount))
 			log.Debug("Running a regular ping test.")
-			if mc.PingTest(5000) {
+			if mc.PingTest(pingTimeoutSec) {
 				mc.lastSuccessfulPing = time.Now()
 				pingFailCount = 0
 			} else {
@@ -477,6 +513,7 @@ MainModemLoop:
 
 			if pingFailCount > 3 {
 				log.Infof("Ping test failed %d times in a row. Reporting failure.", pingFailCount)
+				makeModemFailureEvent("noModemPing", &mc)
 				mc.lastFailedConnection = time.Now()
 				continue MainModemLoop
 			}
@@ -485,6 +522,17 @@ MainModemLoop:
 }
 
 func makeModemEvent(eventType string, mc *ModemController) {
+	addModemEvent(eventType, mc, nil)
+}
+
+// makeModemFailureEvent also logs and adds diagnostics about the modem, to help explain why it
+// failed. It needs to be called before the modem is powered off.
+func makeModemFailureEvent(eventType string, mc *ModemController) {
+	logSetupTimings()
+	addModemEvent(eventType, mc, mc.networkDiagnostics())
+}
+
+func addModemEvent(eventType string, mc *ModemController, diagnostics map[string]string) {
 	log.Printf("Making modem event '%s'.", eventType)
 	signalStrength, bitErrorRate, status, err := mc.signalStrength()
 	if err != nil {
@@ -515,21 +563,25 @@ func makeModemEvent(eventType string, mc *ModemController) {
 		log.Printf("Failed to get iccid: %s", err)
 	}
 
+	details := map[string]any{
+		"signalStatus":     status,
+		"signalStrengthDB": bitErrorRate,
+		"signalStrength":   signalStrength,
+		"band":             band,
+		"simStatus":        simStatus,
+		"apn":              apn,
+		"provider":         provider,
+		"accessTechnology": accessTechnology,
+		"simProvider":      simProvider,
+		"iccid":            iccid,
+	}
+	if diagnostics != nil {
+		details["diagnostics"] = diagnostics
+	}
 	eventclient.AddEvent(eventclient.Event{
 		Timestamp: time.Now(),
 		Type:      eventType,
-		Details: map[string]interface{}{
-			"signalStatus":     status,
-			"signalStrengthDB": bitErrorRate,
-			"signalStrength":   signalStrength,
-			"band":             band,
-			"simStatus":        simStatus,
-			"apn":              apn,
-			"provider":         provider,
-			"accessTechnology": accessTechnology,
-			"simProvider":      simProvider,
-			"iccid":            iccid,
-		},
+		Details:   details,
 	})
 }
 
@@ -542,7 +594,86 @@ func rpiUptime() (time.Duration, error) {
 }
 
 func printSetupStep(i int, text string) {
+	setupTimes.startStep(i, time.Now())
 	log.Infof("Modem set up step (%d/%d): %s", i, modemSetupSteps, text)
+}
+
+// setupTimes is only used from the main modem loop.
+var setupTimes setupTimer
+
+// logSetupTimings logs how long the modem set up steps took, if the modem was being set up.
+func logSetupTimings() {
+	if summary := setupTimes.finish(time.Now()); summary != "" {
+		log.Infof("Modem set up timings: %s", summary)
+	}
+}
+
+// setupTimer records how long each modem set up step takes, from when step 1 starts.
+type setupTimer struct {
+	steps        []string
+	start        time.Time
+	current      int
+	currentStart time.Time
+}
+
+func (t *setupTimer) startStep(step int, now time.Time) {
+	if step == 1 {
+		*t = setupTimer{start: now}
+	}
+	t.finishCurrent(now)
+	t.current = step
+	t.currentStart = now
+}
+
+func (t *setupTimer) finishCurrent(now time.Time) {
+	if t.current != 0 {
+		t.steps = append(t.steps, fmt.Sprintf("step %d %s", t.current, now.Sub(t.currentStart).Round(time.Second)))
+	}
+}
+
+// finish returns a summary of the steps then clears them, or "" if no steps were running.
+func (t *setupTimer) finish(now time.Time) string {
+	if t.current == 0 {
+		return ""
+	}
+	t.finishCurrent(now)
+	summary := fmt.Sprintf("%s, total %s", strings.Join(t.steps, ", "), now.Sub(t.start).Round(time.Second))
+	*t = setupTimer{}
+	return summary
+}
+
+// signalFound returns whether a reading from signalStrength shows a signal. An error doesn't,
+// as signalStrength returns a strength of 0 with it, and 99 means no signal.
+func signalFound(strength int, err error) bool {
+	return err == nil && strength != 99
+}
+
+func hasIPv4Address(addrs []net.Addr) bool {
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// nextPingTestDelay returns how long to wait before the next regular ping test. After a failure
+// it is sooner, so a lost connection is found and reported before the camera might turn off.
+func nextPingTestDelay(testInterval time.Duration, pingFailCount int) time.Duration {
+	if pingFailCount > 0 {
+		return min(testInterval, pingRecheckInterval)
+	}
+	return testInterval
+}
+
+// logRegistrationChange logs the modem's network registration state if it has changed from last,
+// to show how the modem got on while waiting for a connection, and returns the state.
+func logRegistrationChange(mc *ModemController, last string) string {
+	state := mc.registrationState()
+	if state != last {
+		log.Infof("Modem network registration: %s", state)
+	}
+	return state
 }
 
 type VendorProductID struct {
