@@ -179,7 +179,15 @@ func attemptATCommand(req atRequest, atPort string) (string, error) {
 	// Run the given AT command
 	fullResponse, response, err := runATCommand(serialPort, req.cmd)
 	log.Debugf("AT command '%s' full response: %s", req.cmd, formatFullResponse(fullResponse))
-	return response, err
+	return response, withATResponse(err, fullResponse)
+}
+
+// withATResponse adds the modem's reply to an error response, as that can say why the command failed.
+func withATResponse(err error, fullResponse string) error {
+	if errors.Is(err, ErrATErrorResponse) {
+		return fmt.Errorf("%w: %s", err, formatFullResponse(fullResponse))
+	}
+	return err
 }
 
 // Will return the
