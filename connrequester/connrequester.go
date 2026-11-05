@@ -23,25 +23,28 @@ const (
 )
 
 var (
-	maxRetryInterval = time.Hour * 2
-	requestinterval  = time.Second * 20
-	hosts            = []string{
+	maxRetryInterval        = time.Hour * 2
+	requestinterval         = time.Second * 20
+	connectionCheckInterval = time.Second * 10
+	hosts                   = []string{
 		"8.8.8.8",
 		"8.8.4.4",
 	}
 )
 
 type ConnectionRequester struct {
-	stateChange  chan bool
-	sendRequests bool
+	stateChange     chan bool
+	sendRequests    bool
+	checkConnection func() bool
 }
 
 // NewConnectionRequester will return a ConnectionRequester.
 // No connection will be requested until Start is called
 func NewConnectionRequester() *ConnectionRequester {
 	cr := &ConnectionRequester{
-		stateChange:  make(chan bool, 1),
-		sendRequests: false,
+		stateChange:     make(chan bool, 1),
+		sendRequests:    false,
+		checkConnection: CheckConnection,
 	}
 	go cr.requestConnections()
 	return cr
@@ -52,7 +55,7 @@ func NewConnectionRequester() *ConnectionRequester {
 func (cr *ConnectionRequester) WaitUntilUp(timeout time.Duration) error {
 	connectionTimeout := time.After(timeout)
 	for {
-		if CheckConnection() {
+		if cr.checkConnection() {
 			return nil
 		}
 		select {
@@ -67,7 +70,9 @@ func (cr *ConnectionRequester) WaitUntilUp(timeout time.Duration) error {
 // if no connection is made.
 // timeout is the time given to make a connection each try.
 // retryAfter is the duration between attempts, it will multipy by 1.5 after
-// each try with a maximum of 2 hours.
+// each try with a maximum of 2 hours. A connection isn't requested during this
+// time, to save power, but it is still checked for so one that comes up (e.g.
+// WiFi) gets used straight away. Connections are being requested on return.
 // maxRetries is how many times it will try to make a connection. If -1 it will
 // try until a connection is made.
 func (cr *ConnectionRequester) WaitUntilUpLoop(
@@ -84,13 +89,32 @@ func (cr *ConnectionRequester) WaitUntilUpLoop(
 		}
 		retry++
 		cr.Stop() // Stopping requesting to save power
-		log.Println("connection failed. Retry in", retryAfter)
-		time.Sleep(retryAfter)
+		log.Printf("connection failed. Checking every %v and requesting again in %v", connectionCheckInterval, retryAfter)
+		connected := cr.waitForConnection(retryAfter)
+		cr.Start()
+		if connected {
+			return nil
+		}
 		retryAfter = retryAfter * 3 / 2
 		if retryAfter > maxRetryInterval {
 			retryAfter = maxRetryInterval
 		}
-		cr.Start()
+	}
+}
+
+// waitForConnection returns true once there is a connection, or false if there
+// still isn't one after the given duration. It doesn't request a connection.
+func (cr *ConnectionRequester) waitForConnection(duration time.Duration) bool {
+	deadline := time.Now().Add(duration)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		time.Sleep(min(connectionCheckInterval, remaining))
+		if cr.checkConnection() {
+			return true
+		}
 	}
 }
 
@@ -120,15 +144,24 @@ func checkDNS() bool {
 }
 
 func pingAllHosts(interfaceName string) bool {
-	pingChan := make(chan bool)
+	return anyHostResponds(hosts, time.Second*pingTimeout, func(host string) bool {
+		return ping(interfaceName, host)
+	})
+}
+
+// anyHostResponds returns true as soon as pingHost does for one of the hosts, or false once it
+// has failed for all of them or the timeout has passed.
+func anyHostResponds(hosts []string, pingTimeout time.Duration, pingHost func(host string) bool) bool {
+	// Buffered so that the goroutines can still exit if this has already returned.
+	pingChan := make(chan bool, len(hosts))
 	for _, host := range hosts {
 		go func(host string) {
-			pingChan <- ping(interfaceName, host)
+			pingChan <- pingHost(host)
 		}(host)
 	}
 	fails := 0
 	success := false
-	timeout := time.After(time.Second * pingTimeout)
+	timeout := time.After(pingTimeout)
 	for {
 		select {
 		case success = <-pingChan:
